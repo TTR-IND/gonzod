@@ -1,0 +1,15 @@
+Source: gonzod
+Section: admin
+Priority: optional
+Maintainer: GonzOS Packaging <packages@gonzos.invalid>
+Build-Depends: debhelper-compat (= 13), gcc, make
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: gonzod
+Architecture: any
+Depends: ${misc:Depends}, util-linux, udev
+Description: topology-aware system policy compiler
+ gonzod discovers hardware topology and applies CPU, cgroup, storage and IRQ
+ policy at lifecycle edges.  Policy is deliberately not applied by package
+ installation; run gonzod enable after reviewing the local system.

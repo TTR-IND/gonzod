@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: gonzod
+Source: https://github.com/TTR-IND/gonzod
+
+Files: *
+Copyright: 2026 Josh A. Wheatstone, Torfaen Technology Research IND
+License: UNKNOWN
+ No licence grant is included in the upstream source archive. Redistribution
+ must not proceed until the upstream copyright holder supplies one.
