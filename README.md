@@ -1,10 +1,6 @@
 # gonzod
 
-Topology-aware system policy compiler. Salvage of rookd.
-
-rookd got good, then it kept growing until the pieces fought each
-other. gonzod is the same laptop-tested policy with a hard fence
-around what it is allowed to touch.
+Topology-aware system policy compiler. 
 
 ## What it owns
 
