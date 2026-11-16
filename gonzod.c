@@ -1,7 +1,7 @@
 /*
  * gonzod.c -- Gonzo system policy compiler
  *
- * Salvage of rookd. Same hardware-tested tunables. Different fence.
+ * Salvage of rookd. Hardware-aware power and scheduling policy compiler.
  *
  * gonzod owns topology, cgroup lanes, scheduler, cpufreq, IRQ
  * affinity, dirty writeback, and storage queues.
@@ -19,7 +19,9 @@
  *   gonzod disable   tear down
  *   gonzod cpufreq   udev hook
  *   gonzod status
+ *   gonzod inspect   report power state
  *   gonzod install / uninstall
+ *   gonzod inspect
  *
  *   gcc -O2 -Wall -Wextra -Wno-unused-parameter -o gonzod gonzod.c
  */
@@ -37,10 +39,9 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/utsname.h>
 #include <time.h>
 
-#define GONZO_VERSION  "1.0.0"
+#define GONZO_VERSION  "2.0.0"
 #define GONZO_STATE    "/run/gonzo"
 #define GONZO_CGROUP   "/sys/fs/cgroup/gonzo"
 #define GONZO_LOG      "/var/log/gonzod.log"
@@ -492,7 +493,18 @@ static void build_cgroups(void)
     write_cg("batch",       "io.weight",  "200");
     write_cg("maintenance", "cpu.weight", "50");
     write_cg("maintenance", "io.weight",  "50");
-    write_cg("interactive", "cpuset.cpus", g_topo.all_cpus);
+
+    /* Partition only when the topology strategy computed distinct sets.
+       SHARED keeps every lane on the full mask. */
+    if (g_topo.use_cpuset) {
+        write_cg("interactive", "cpuset.cpus", g_topo.interactive_cpus);
+        write_cg("batch",       "cpuset.cpus", g_topo.batch_cpus);
+        write_cg("maintenance", "cpuset.cpus", g_topo.batch_cpus);
+    } else {
+        write_cg("interactive", "cpuset.cpus", g_topo.all_cpus);
+        write_cg("batch",       "cpuset.cpus", g_topo.all_cpus);
+        write_cg("maintenance", "cpuset.cpus", g_topo.all_cpus);
+    }
 
     /*
      * memory.low, not memory.min. min is unreclaimable — detritusd
@@ -566,14 +578,21 @@ static void bind_login(void)
 
 static void set_scheduler(void)
 {
-    rlog("RT scheduler policy");
-    struct utsname u;
-    if (uname(&u) == 0) {
-        if (strstr(u.version, "PREEMPT_RT") || strstr(u.version, "-rt"))
-            rlog("  Kernel: PREEMPT_RT confirmed");
-        else
-            rlog("  PREEMPT_RT not confirmed — tunables applied anyway");
+    rlog("Scheduler policy (stock kernel, preempt=lazy)");
+    int lazy = 0;
+    FILE *cmd = fopen("/proc/cmdline", "r");
+    if (cmd) {
+        char line[1024] = {0};
+        if (fgets(line, sizeof(line), cmd))
+            lazy = strstr(line, "preempt=lazy") != NULL;
+        fclose(cmd);
     }
+    if (lazy)
+        rlog("  Kernel: preempt=lazy confirmed");
+    else
+        rlog("  preempt=lazy not on cmdline — tunables applied anyway");
+
+    /* RT bandwidth caps still apply on stock kernels (SCHED_FIFO/RR). */
     write_sysctl("kernel.sched_rt_period_us", "1000000");
     write_sysctl("kernel.sched_rt_runtime_us", "950000");
     write_sysctl("kernel.sched_rr_timeslice_ms", "4");
@@ -581,16 +600,44 @@ static void set_scheduler(void)
     write_sysctl("kernel.sched_schedstats", "0");
 }
 
+static int on_ac_power(void)
+{
+    DIR *d = opendir("/sys/class/power_supply");
+    if (!d) return 1; /* assume AC if unreadable */
+    struct dirent *ent;
+    int ac = 1;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char typepath[256], onlinepath[256];
+        snprintf(typepath, sizeof(typepath),
+            "/sys/class/power_supply/%s/type", ent->d_name);
+        char type[32] = {0};
+        if (read_str(typepath, type, sizeof(type)) != 0) continue;
+        if (strcmp(type, "Mains") != 0 && strcmp(type, "USB") != 0) continue;
+        snprintf(onlinepath, sizeof(onlinepath),
+            "/sys/class/power_supply/%s/online", ent->d_name);
+        long on = read_long(onlinepath, 1);
+        if (on == 0) { ac = 0; break; }
+    }
+    closedir(d);
+    return ac;
+}
+
 static void tune_cpufreq(void)
 {
     rlog("CPU frequency governor");
     const char *gov = "schedutil";
     int ncpus = g_topo.ncpus > 0 ? g_topo.ncpus : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    int ac = on_ac_power();
+    const char *epp = ac ? "balance_performance" : "power";
+    rlog("  power source: %s  EPP preference: %s", ac ? "AC" : "battery", epp);
+
     for (int i = 0; i < ncpus; i++) {
         char path[128];
         snprintf(path, sizeof(path),
             "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", i);
         write_file(path, gov);
+
         char minpath[128], minval[32];
         snprintf(minpath, sizeof(minpath),
             "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_min_freq", i);
@@ -601,13 +648,19 @@ static void tune_cpufreq(void)
                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_min_freq", i);
             write_file(path, minval);
         }
+
+        /* Intel HWP Energy Performance Preference, if the driver exposes it. */
+        snprintf(path, sizeof(path),
+            "/sys/devices/system/cpu/cpu%d/cpufreq/energy_performance_preference", i);
+        if (access(path, W_OK) == 0)
+            write_file(path, epp);
     }
     {
         const char *udev_path = "/etc/udev/rules.d/99-gonzod-cpufreq.rules";
         FILE *f = fopen(udev_path, "w");
         if (f) {
             fprintf(f,
-                "# gonzod -- reapply CPU governor on power source change\n"
+                "# gonzod -- reapply CPU governor + EPP on power source change\n"
                 "SUBSYSTEM==\"power_supply\", ATTR{type}==\"Mains\","
                 " RUN+=\"/usr/local/sbin/gonzod cpufreq\"\n");
             fclose(f);
@@ -680,18 +733,21 @@ static void calm_writeback(void)
     rlog("Writeback (storage-aware dirty policy)");
     int slow_storage = (strcmp(g_topo.storage_type, "emmc") == 0 ||
                         strcmp(g_topo.storage_type, "hdd") == 0);
+    /* Batched writeback for every medium. Frequent 100 ms writeback
+       prevents SSD idle residency and package C-state entry.
+       Slow media keep the same numbers; fast media no longer trickle. */
     if (slow_storage) {
         rlog("  slow storage (%s) — batching policy", g_topo.storage_type);
         write_sysctl("vm.dirty_background_bytes", "33554432");
         write_sysctl("vm.dirty_bytes", "134217728");
-        write_sysctl("vm.dirty_expire_centisecs", "1500");
+        write_sysctl("vm.dirty_expire_centisecs", "3000");
         write_sysctl("vm.dirty_writeback_centisecs", "500");
     } else {
-        rlog("  fast storage (%s) — trickle policy", g_topo.storage_type);
-        write_sysctl("vm.dirty_background_bytes", "16777216");
-        write_sysctl("vm.dirty_bytes", "67108864");
-        write_sysctl("vm.dirty_expire_centisecs", "10");
-        write_sysctl("vm.dirty_writeback_centisecs", "10");
+        rlog("  fast storage (%s) — batched policy", g_topo.storage_type);
+        write_sysctl("vm.dirty_background_bytes", "33554432");
+        write_sysctl("vm.dirty_bytes", "134217728");
+        write_sysctl("vm.dirty_expire_centisecs", "3000");
+        write_sysctl("vm.dirty_writeback_centisecs", "500");
     }
     write_sysctl("vm.stat_interval", "10");
     if (g_topo.numa_nodes <= 1)
@@ -784,6 +840,56 @@ static void write_status(void)
     rlog("Policy compiled.");
 }
 
+
+static void cmd_inspect(void)
+{
+    rlog("inspect: hardware power state");
+    char buf[256];
+
+    if (read_str("/sys/devices/system/cpu/cpuidle/current_driver", buf, sizeof(buf)) == 0)
+        rlog("  cpuidle driver: %s", buf);
+    if (read_str("/sys/devices/system/cpu/cpuidle/current_governor", buf, sizeof(buf)) == 0)
+        rlog("  cpuidle governor: %s", buf);
+
+    int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (n > 4) n = 4; /* sample first few */
+    for (int i = 0; i < n; i++) {
+        char path[128];
+        snprintf(path, sizeof(path),
+            "/sys/devices/system/cpu/cpu%d/cpufreq/energy_performance_preference", i);
+        if (read_str(path, buf, sizeof(buf)) == 0)
+            rlog("  cpu%d EPP: %s", i, buf);
+        snprintf(path, sizeof(path),
+            "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", i);
+        if (read_str(path, buf, sizeof(buf)) == 0)
+            rlog("  cpu%d governor: %s", i, buf);
+    }
+
+    rlog("  dirty_expire_centisecs = %ld",
+         read_long("/proc/sys/vm/dirty_expire_centisecs", -1));
+    rlog("  dirty_writeback_centisecs = %ld",
+         read_long("/proc/sys/vm/dirty_writeback_centisecs", -1));
+
+    /* Sample a few PCI runtime statuses */
+    DIR *d = opendir("/sys/bus/pci/devices");
+    if (d) {
+        struct dirent *ent;
+        int shown = 0;
+        while ((ent = readdir(d)) != NULL && shown < 8) {
+            if (ent->d_name[0] == '.') continue;
+            char path[512];
+            snprintf(path, sizeof(path),
+                "/sys/bus/pci/devices/%s/power/runtime_status", ent->d_name);
+            if (read_str(path, buf, sizeof(buf)) == 0) {
+                rlog("  pci %s runtime_status: %s", ent->d_name, buf);
+                shown++;
+            }
+        }
+        closedir(d);
+    }
+    rlog("inspect complete");
+}
+
 static void do_compile(void)
 {
     discover_topology();
@@ -807,11 +913,19 @@ static void do_reset(void)
         rmdir(path);
     }
     rmdir(GONZO_CGROUP);
+
+    /* Restore writeback to conservative kernel-like defaults so the
+       device is not left in the aggressive trickle state. */
+    write_sysctl("vm.dirty_background_bytes", "0");
+    write_sysctl("vm.dirty_bytes", "0");
+    write_sysctl("vm.dirty_expire_centisecs", "3000");
+    write_sysctl("vm.dirty_writeback_centisecs", "500");
     write_sysctl("kernel.sched_rt_runtime_us", "950000");
+
     char path[256];
     snprintf(path, sizeof(path), "%s/status", GONZO_STATE); unlink(path);
     snprintf(path, sizeof(path), "%s/topology", GONZO_STATE); unlink(path);
-    rlog("Reset complete");
+    rlog("Reset complete (writeback restored to batched defaults)");
 }
 
 static const char *find_runsvdir(void)
@@ -957,7 +1071,8 @@ static void usage(void)
         "  cpufreq     Reapply CPU governor (udev hook)\n"
         "  install     Wire lifecycle hooks\n"
         "  uninstall   Remove lifecycle hooks\n"
-        "  status      Print current policy state\n\n"
+        "  status      Print current policy state\n"
+        "  inspect     Report idle, EPP, writeback and device PM state\n\n"
         "Does not own ZRAM, swappiness, or discard (detritusd).\n"
         "Does not own page-cache hold (gonzocache).\n"
         "Does not rewrite Xorg or audio service scripts.\n",
@@ -997,6 +1112,8 @@ int main(int argc, char *argv[])
         tune_cpufreq();
     } else if (strcmp(cmd, "status") == 0) {
         cmd_status();
+    } else if (strcmp(cmd, "inspect") == 0) {
+        cmd_inspect();
     } else if (strcmp(cmd, "install") == 0) {
         do_install();
     } else if (strcmp(cmd, "uninstall") == 0) {

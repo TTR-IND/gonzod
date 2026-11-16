@@ -22,24 +22,70 @@ require_root() {
     [ "$(id -u)" -eq 0 ] || die "must be run as root"
 }
 
-install_rt_kernel() {
-    log "installing PREEMPT_RT kernel (linux-image-rt-amd64 + headers)"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y linux-image-rt-amd64 linux-headers-rt-amd64 \
-        || die "apt failed installing linux-image-rt-amd64 / linux-headers-rt-amd64"
+ensure_preempt_lazy() {
+    log "adding preempt=lazy to the default Linux GRUB entry"
+    local grub="/etc/default/grub"
+    local cfg="/boot/grub/grub.cfg"
+
+    # Durable source: GRUB_CMDLINE_LINUX_DEFAULT is what the default
+    # (non-recovery) linux line is built from.
+    if [ -f "$grub" ]; then
+        if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=.*preempt=lazy' "$grub"; then
+            log "preempt=lazy already in GRUB_CMDLINE_LINUX_DEFAULT"
+        elif grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub"; then
+            sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/"$/ preempt=lazy"/' "$grub"
+            # If the line used single quotes, handle that too.
+            sed -i "/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/'$/ preempt=lazy'/" "$grub"
+            log "appended preempt=lazy to GRUB_CMDLINE_LINUX_DEFAULT"
+        else
+            echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet preempt=lazy"' >> "$grub"
+            log "created GRUB_CMDLINE_LINUX_DEFAULT with preempt=lazy"
+        fi
+    else
+        warn "$grub not found"
+    fi
+
     if command -v update-grub >/dev/null 2>&1; then
         update-grub || die "update-grub failed"
     elif command -v grub-mkconfig >/dev/null 2>&1; then
-        grub-mkconfig -o /boot/grub/grub.cfg || die "grub-mkconfig failed"
+        grub-mkconfig -o "$cfg" || die "grub-mkconfig failed"
     else
-        warn "update-grub not found — RT kernel is installed, bootloader not refreshed"
+        warn "update-grub not found"
     fi
-    log "RT kernel packaged. Reboot onto the -rt image before expecting PREEMPT_RT."
+
+    # Confirm the default menuentry's linux line carries the flag.
+    # The first 'menuentry' is the default; its first 'linux' line is the boot line.
+    if [ -f "$cfg" ]; then
+        if awk '
+            /^menuentry / { in_default = (seen++ == 0) }
+            in_default && /^[[:space:]]*linux / {
+                if ($0 ~ /preempt=lazy/) found = 1
+                exit
+            }
+            END { exit !found }
+        ' "$cfg"; then
+            log "default linux line already has preempt=lazy"
+        else
+            # Inject into the first linux line of the first menuentry only.
+            awk '
+                /^menuentry / { in_default = (seen++ == 0) }
+                in_default && !done && /^[[:space:]]*linux / && $0 !~ /preempt=lazy/ {
+                    sub(/$/, " preempt=lazy")
+                    done = 1
+                }
+                { print }
+            ' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+            log "patched default menuentry linux line with preempt=lazy"
+        fi
+    else
+        warn "$cfg not found — flag is in /etc/default/grub; regenerate the bootloader"
+    fi
+    log "reboot to boot the stock kernel with preempt=lazy"
 }
 
 install_all() {
     [ -f "$SRC" ] || die "gonzod.c not found at $SRC"
-    install_rt_kernel
+    ensure_preempt_lazy
     log "building gonzod..."
     local tmp="/tmp/gonzod-build-$$"
     gcc -O2 -Wall -Wextra -Wno-unused-parameter -o "$tmp" "$SRC" \
